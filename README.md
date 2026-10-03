@@ -35,32 +35,25 @@
 | nvcc / ptxas / cicc | 13.0.88 | 三者必须同版本，否则 PTX 版本不匹配 |
 | transformers | 5.6.0 | 由 pyproject 锁定 |
 | flashinfer | 0.6.11 | 不可用，见下方已知冲突 |
-| attention backend | **triton** | 全线统一使用 |
-| sampling backend | **pytorch** | 必须显式指定 |
+| attention backend | **flashinfer** | 全线统一使用 |
+| sampling backend | **flashinfer**** | 必须显式指定 |
 | Rust | 1.99.0 | 编译 SGLang router 需要 |
 | 测试模型 | Qwen2.5-0.5B-Instruct | 988 MB，bf16 |
 
-#### 已知依赖冲突（已解决，但必须声明为实验条件）
+## 已知依赖冲突（2026-10-03 修订）
 
-**1. transformers 5.6.0 与 kernels 冲突**
+1. transformers 5.6.0 × kernels 0.17.x —— 维持处理
+   发生在 import transformers 期（hub_kernels.py:89 构造 LayerRepository 未传 revision），
+   与 attention backend 无关：装了 kernels 时任何 backend 都起不来。
+   解法：uv pip uninstall kernels（终审结论，不装）。影响轻微，SGLang 核心路径不经 transformers。
 
-`import sglang` 时抛 ValueError。解法：`uv pip uninstall kernels`。
-影响：Hub kernel 关闭，退回参考实现；SGLang 核心路径不经 transformers。
+2. flashinfer 无法构建 —— 2026-10-03 复测推翻
+   早期结论是在 CUDA 工具链未对齐（nvvm 停 13.4 / ptxas 13.0）时下的。
+   工具链锁齐 13.0 后，flashinfer 0.6.11.post1（flashinfer-python + flashinfer-cubin
+   344 MB 预编译 cubin）无需现场编译 CUTLASS，可直接启用。
+   复测：启动成功、CUDA graph 捕获成功、四层验收（含 8 并发）全过。
 
-**2. flashinfer 无法构建**
-
-需要 CUDA 13.1 以上才能编译，但 torch 被锁在 cu130，两者不可兼得。
-解法：`--attention-backend triton` 且 `--sampling-backend pytorch`。
-影响：attention 与 sampling 算子实现变更，所有实验组必须保持一致。
-
-**3. "能启动" 不等于 "能用"**
-
-曾出现 `ready to roll`、health 返回 200、warmup 返回 200，
-但第一个真实请求返回 HTTP 000（进程崩溃）。
-原因：sampling 默认走 flashinfer，真实请求才触发 JIT 编译。
-教训：验收必须发真实请求，不能只看启动日志。
-
----
+教训：先决条件变了要回头复审 —— 环境混乱期的判定，稳定后值得重测一次。
 
 ## 三、复现步骤
 
@@ -78,8 +71,8 @@
       --host 127.0.0.1 --port 30000 \
       --mem-fraction-static 0.35 \
       --served-model-name qwen05b \
-      --attention-backend triton \
-      --sampling-backend pytorch \
+      --attention-backend flashinfer \
+      --sampling-backend flashinfer \
       > ~/sglang-30000.log 2>&1 &
 
     tail -f ~/sglang-30000.log   # 等到出现 ready to roll
@@ -127,3 +120,27 @@
 - 模型权重：0.98 GB，分配后可用显存 4.15 GB
 
 详细环境踩坑记录见 env/wsl.md
+
+## 实验条件与已知受限（2026-10-03 定稿）
+
+| 条件 | 值 |
+|---|---|
+| attention backend | flashinfer 0.6.11.post1 |
+| sampling backend | flashinfer 0.6.11.post1 |
+| CUDA graph | 开启（bs [1,2,4,8] + piecewise 至 2048 tokens） |
+| transformers Hub kernels | 关闭（kernels 包不安装） |
+| CUDA 工具链 | 13.0 拼装版（无 Nsight / cuda-gdb / CUTLASS） |
+| PyTorch | 2.11.0+cu130（pyproject 硬钉，官方规格，非降级） |
+| 平台 | WSL2 Ubuntu 24.04 on Windows 11，RTX 4060 Laptop，可用显存 ~6.5GB |
+| 稳定性判据 | power.draw CV ≤ 5% + clocks.sm ≥ 0.95 × f_base（f_base 必须实测） |
+
+历史记录：早期因 CUDA 工具链未对齐曾使用 triton，2026-10-03 复测后
+flashinfer 全量恢复，108 组全部改用 flashinfer。
+
+已知边界（不影响组间结论）：
+- 无 Nsight → 无算子级归因
+- MPS 在 WSL2 下不可用 → 阶段二按时间片轮转语义设计
+- GPU 时间戳不准 → 主时间戳用 WSL 侧 date +%s.%N
+
+以上条件在全部 108 组中保持一致，因此组间可比性不受影响。
+绝对数值不可与采用完整 CUDA Toolkit 或开启 MPS 的环境直接比较。
